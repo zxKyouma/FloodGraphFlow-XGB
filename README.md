@@ -1,5 +1,5 @@
 # FloodGraphFlow-XGB
-Solution for the Kaggle competition **UrbanFloodBench: Flood Modelling**
+Solution for the Kaggle competition [**UrbanFloodBench: Flood Modelling**](https://www.kaggle.com/competitions/urban-flood-modelling/overview)
 
 Co-developed by team **NSEOverflow**
 - Brandon Low — [@zxKyouma](https://github.com/zxKyouma)
