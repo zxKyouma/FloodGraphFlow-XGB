@@ -80,7 +80,16 @@ python scripts/run_floodgraphflow_xgb.py \
     --backend xgboost_cpu \
     --load_model_path saved_models/model2_best.pkl \
     --dump_test_predictions predictions/model2_test_predictions.parquet
+
+# Merge for submission
+python scripts/merge_xgb_submission.py \
+    --sample sample_submission.parquet \
+    --model1 predictions/model1_test_predictions.parquet \
+    --model2 predictions/model2_test_predictions.parquet \
+    --output submissions/floodgraphflow_xgb_submission.parquet
 ```
+*Note: `sample_submission.parquet` can be retrieved from the [competition website](https://www.kaggle.com/competitions/urban-flood-modelling/data?select=sample_submission.parquet)
+
 ## Approach
 
 We use a **graph-aware stacked XGBoost pipeline** rather than a single end-to-end sequence model.
