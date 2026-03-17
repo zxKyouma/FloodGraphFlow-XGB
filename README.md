@@ -58,16 +58,10 @@ FloodGraphFlow-XGB
 The models for Cities 1 and 2 are trained with the following commands:
 ```
 # Train Model_1
-python scripts/run_floodgraphflow_xgb.py \
-    --config configs/model1_best.yaml \
-    --backend xgboost_gpu \
-    --save_model_path saved_models/model1_best.pkl 
+bash scripts/train_model1_best.sh
 
 # Train Model_2
-python scripts/run_floodgraphflow_xgb.py \
-    --config configs/model2_best.yaml \
-    --backend xgboost_gpu \
-    --save_model_path saved_models/model2_best.pkl 
+bash scripts/train_model2_best.sh
 ```
 
 ## Inference
@@ -180,8 +174,23 @@ A detailed list of all included features is included in `FEATURES.md`.
 ---
 
 ### Model Ablations
-Model | Addition | City 2 Score (local validation)
-A | Baseline XGBoost |
-B | A + graph features |
-C | B + 
-D | C + mass deficit features
+| Model | Addition | City 2 Score |
+|---|---|---:|
+| A | Baseline XGBoost | 0.203494 |
+| B | A + pruned feature set + graph / qhat graph-neighbor features | 0.141594 |
+| C | B + auxiliary `peak_within_24` target | 0.138205 |
+| D | C + basin / storage mass-deficit framing | 0.084896 |
+| E | D + node priors + downstream lockup + subcatchment mass-deficit | 0.079190 |
+| F | E + `twi_spi` + multiscale mass mismatch + `HAND` proxy features | 0.077998 |
+| G | F + phase-MoE pilot | 0.077271 |
+| H | G + pruneA regime cleanup | 0.076822 |
+| I | H + edge-aware downstream features | 0.076526 |
+| J | I + node drop priors | 0.075713 |
+| K | J + drain-regime priors | 0.074033 |
+| L | K + endpoint boundary features | 0.074011 |
+| M | L + upstream historical EMA features | 0.065236 |
+| N | M + `qin/qout/qnet` historical EMA features | 0.056407 |
+| O | N + surcharge expert + deep-storage expert | 0.051369 |
+| P | O + split directional `qnet` history EMA | 0.048904 |
+
+*Note: M was used as the final model, as models N, O, and P performed worse on the public Kaggle leaderboard
