@@ -28,7 +28,8 @@ After downloading:
 2. Place the extracted folders in the project root (`./`) 
 3. Run the metadata setup script:
    ```bash
-   scripts/populate_model_metadata.sh
+   bash scripts/populate_model_metadata.sh
+   ```
 
 ## Repository Structure
 Your directory should look like this:
@@ -88,7 +89,7 @@ python scripts/merge_xgb_submission.py \
     --model2 predictions/model2_test_predictions.parquet \
     --output submissions/floodgraphflow_xgb_submission.parquet
 ```
-*Note: `sample_submission.parquet` can be retrieved from the [competition website](https://www.kaggle.com/competitions/urban-flood-modelling/data?select=sample_submission.parquet)
+*Note: `sample_submission.parquet` should be downloaded from the [competition website](https://www.kaggle.com/competitions/urban-flood-modelling/data?select=sample_submission.parquet).*
 
 ## Approach
 
