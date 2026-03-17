@@ -127,6 +127,12 @@ At a high level, the model works in **four stages**.
 
 ### Hyperparameters
 
+All hyperparameters were tuned using **Optuna**.
+
+- **Main regressor:** 800 trees, learning rate 0.03, max depth 8  
+- **Regime classifier:** 600 trees, learning rate 0.03, max depth 6  
+- **Event settings:** quantile = 0.88, horizon = 24 
+
 ---
 
 ### Feature Engineering
