@@ -47,8 +47,38 @@ FloodGraphFlow-XGB
 
 ## Model Training
 
-## Inference
+The models for Cities 1 and 2 are trained with the following commands:
+```
+# Train Model_1
+python scripts/run_floodgraphflow_xgb.py \
+    --config configs/model1_best.yaml \
+    --backend xgboost_gpu \
+    --save_model_path saved_models/model1_best.pkl 
 
+# Train Model_2
+python scripts/run_floodgraphflow_xgb.py \
+    --config configs/model2_best.yaml \
+    --backend xgboost_gpu \
+    --save_model_path saved_models/model2_best.pkl 
+```
+
+## Inference
+Model inference can be done with the following commands:
+```
+# Model_1 test predictions
+python scripts/run_floodgraphflow_xgb.py \
+    --config configs/model1_best.yaml \
+    --backend xgboost_cpu \
+    --load_model_path saved_models/model1_best.pkl \
+    --dump_test_predictions predictions/model1_test_predictions.parquet
+
+# Model_2 test predictions
+python scripts/run_floodgraphflow_xgb.py \
+    --config configs/model2_best.yaml \
+    --backend xgboost_cpu \
+    --load_model_path saved_models/model2_best.pkl \
+    --dump_test_predictions predictions/model2_test_predictions.parquet
+```
 ## Approach
 
 We use a **graph-aware stacked XGBoost pipeline** rather than a single end-to-end sequence model.
