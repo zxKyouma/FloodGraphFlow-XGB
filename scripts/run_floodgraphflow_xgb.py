@@ -56,11 +56,13 @@ from train import load_dataset  # noqa: E402
 from data import dataset_factory  # noqa: E402
 from utils import Logger, file_utils, metric_utils  # noqa: E402
 
-
+# Note: this script is designed for fast iteration on XGBoost-based baselines and ablations, but the core pipeline supports multiple backend regressors and is easily extensible to other model types.
 def parse_args() -> argparse.Namespace:
+    # TODO: consider splitting into separate scripts for pure regression baseline, two-stage event-regime model, and MoE/expert-slice pilots to reduce argument complexity and surface only relevant options per script.
     p = argparse.ArgumentParser(
         description="Submission-equivalent rain baseline on full val (no post-t10 dynamic leakage)."
     )
+    
     p.add_argument("--config", required=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max_events_train", type=int, default=-1)
@@ -2360,7 +2362,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_recession_type1_only", action="store_false", dest="recession_type1_only")
     return p.parse_args()
 
-
 def _build_qnet_state_feature_block(
     qhat: np.ndarray,
     eid: np.ndarray,
@@ -2369,6 +2370,20 @@ def _build_qnet_state_feature_block(
     roll_windows=(3, 8, 24),
     lags=(1, 2, 4),
 ) -> np.ndarray:
+    '''
+    This function constructs a block of temporal state features for qnet/qin/qout rows based on the input qhat predictions and event/node/time information.
+
+    Parameters:
+    - qhat: 1D array of predicted q values (shape (num_rows,))
+    - eid: 1D array of event IDs corresponding to each row (shape (num_rows,))
+    - nidx: 1D array of node indices corresponding to each row (shape (num_rows,))
+    - tr: 1D array of relative time steps corresponding to each row (shape (num_rows,))
+    - roll_windows: tuple of integers specifying the window sizes for rolling sum features
+    - lags: tuple of integers specifying the lag steps for lag features
+
+    The output is a 2D array of shape (num_rows, 1 + 1 + len(roll_windows) + len(lags)) containing the constructed features for each row, in the original order.
+    The function handles empty input and ensures that the output features are aligned with the original row order.
+    '''
     q = np.asarray(qhat, dtype=np.float32).reshape(-1)
     eid = np.asarray(eid, dtype=np.int64).reshape(-1)
     nidx = np.asarray(nidx, dtype=np.int64).reshape(-1)
@@ -2391,6 +2406,7 @@ def _build_qnet_state_feature_block(
     key_prev = None
     acc = 0.0
     hist = []
+    # Iterate in sorted order to build cumulative sum, rolling sums, and lag features for each (event, node) sequence.
     for i in range(q_s.shape[0]):
         key = (int(eid_s[i]), int(nidx_s[i]))
         if key != key_prev:
@@ -2416,13 +2432,15 @@ def _build_qnet_state_feature_block(
                 lag_feats[li][i] = 0.0
         hist.append(qi)
 
+    # Revert to original order and stack features: [qhat, cumulative sum, roll_feats..., lag_feats...]
     inv = np.empty_like(order)
     inv[order] = np.arange(order.shape[0])
     cols = [q.reshape(-1, 1), csum[inv][:, None]]
     cols.extend([rf[inv][:, None] for rf in roll_feats])
     cols.extend([lf[inv][:, None] for lf in lag_feats])
-    return np.concatenate(cols, axis=1).astype(np.float32, copy=False)
 
+    # The final output has shape (num_rows, 1 + 1 + len(roll_windows) + len(lags)) and is aligned with the original row order.
+    return np.concatenate(cols, axis=1).astype(np.float32, copy=False)
 
 def _fit_qnet_temporal_refiner(
     qhat_tr: np.ndarray,
@@ -2437,6 +2455,27 @@ def _fit_qnet_temporal_refiner(
     max_rows: int,
     type1_only: bool,
 ):
+    '''
+    This function fits a simple Ridge regression model to learn a temporal refiner that predicts the true q values from the initial qhat predictions and temporal state features.
+    A Ridge regression means that the model will learn coefficients for each input feature that minimize the squared error between the predicted and true q values, while also penalizing large coefficients to prevent overfitting. The regularization strength is determined by the alpha parameter, where a higher alpha means more regularization (more penalty on large coefficients) and a lower alpha means less regularization.
+    It is used to refine the initial qhat predictions by learning a correction based on the temporal state features, which can capture patterns in the data that are not accounted for by the initial qhat model. The blend parameter controls how much of the refiner's prediction is combined with the original qhat prediction when applying the refiner to new data.
+
+    Parameters:
+    - qhat_tr: 1D array of initial q predictions for training rows
+    - qtrue_tr: 1D array of true q values for training rows
+    - nt_tr: 1D array of event IDs for training rows
+    - tr_tr: 1D array of relative time steps for training rows
+    - qstate_tr: 2D array of temporal state features for training rows
+    - sample_weight_tr: Optional 1D array of sample weights for training rows
+    - seed: Random seed for reproducibility in row sampling
+    - alpha: Regularization strength for Ridge regression
+    - blend: Blend factor for combining qhat and refiner predictions
+    - max_rows: Maximum number of training rows to use for fitting the refiner
+    - type1_only: Whether to restrict training to type-1 rows (nt == 1)
+
+    The function performs data validation, optional filtering for type-1 rows, and random sampling if the number of valid rows exceeds max_rows. It then fits a Ridge regression model using the selected features and returns the learned parameters in a dictionary.
+    The output dictionary contains the coefficients, intercept, blend factor, and type1_only flag for use in the refiner application function.
+    '''
     q = np.asarray(qhat_tr, dtype=np.float32).reshape(-1)
     y = np.asarray(qtrue_tr, dtype=np.float32).reshape(-1)
     nt = np.asarray(nt_tr, dtype=np.int64).reshape(-1)
@@ -2493,7 +2532,6 @@ def _fit_qnet_temporal_refiner(
     }
     return params
 
-
 def _apply_qnet_temporal_refiner(
     qhat: np.ndarray,
     nt: np.ndarray,
@@ -2501,6 +2539,20 @@ def _apply_qnet_temporal_refiner(
     qstate: np.ndarray,
     params: dict | None,
 ) -> np.ndarray:
+    '''
+    This function applies the fitted temporal refiner to new qhat predictions and temporal state features, using the parameters learned from the Ridge regression model.
+    It takes the initial qhat predictions and the corresponding temporal state features, and computes a refined prediction by applying the learned coefficients and blend factor from the refiner parameters. 
+    The function also includes gating logic to determine which rows should be adjusted based on the validity of the predictions and the relative time steps.
+    Parameters:
+    - qhat: 1D array of initial q predictions for the rows to refine
+    - nt: 1D array of event IDs for the rows to refine
+    - tr: 1D array of relative time steps for the rows to refine
+    - qstate: 2D array of temporal state features for the rows to refine
+    - params: Dictionary of parameters learned from the Ridge regression model, containing 'coef', 'intercept', 'blend', and 'type1_only'
+
+    The function computes the refiner's prediction using the input features and the learned coefficients, and then blends it with the original qhat predictions according to the blend factor.
+    The output is a 1D array of refined q predictions, where the refiner's prediction has been applied to the rows that meet the gating criteria (finite predictions, sufficient relative time, and optionally type-1 only).
+    '''
     q = np.asarray(qhat, dtype=np.float32).reshape(-1)
     if not isinstance(params, dict):
         return q
@@ -2535,7 +2587,6 @@ def _apply_qnet_temporal_refiner(
     out[mask] = ((1.0 - blend) * q[mask] + blend * pred[mask]).astype(np.float32, copy=False)
     return out
 
-
 def _build_qinout_drain_dynamics_block(
     qin_hat: np.ndarray,
     qout_hat: np.ndarray,
@@ -2547,18 +2598,32 @@ def _build_qinout_drain_dynamics_block(
     late_start: int = 108,
 ) -> np.ndarray:
     """
-    Compact drain-focused dynamics from Stage-A qin/qout channels.
-    Features:
-    1) net = qin-qout
-    2) cumulative net pseudo-state
-    3) cumulative net normalized
-    4) dnet_w1
-    5) dnet_w3
-    6) negative-net run length (normalized)
-    7) soft drain gate (sigmoid on -net)
-    8) drain opportunity = soft_gate * neg_run * sqrt(area) * type1
-    9) late_soft = soft_gate * late
-    10) late_drain_opportunity
+    This function constructs a block of features designed to capture the dynamics of inflow (qin) and outflow (qout) for 1D nodes, with the goal of providing informative signals about potential drainage opportunities and flow regimes.
+    The features include the net flow (qin - qout), cumulative net flow, normalized cumulative net flow, first and third differences in net flow, a running count of consecutive negative net flow values (as a proxy for potential drainage), a soft gate based on the net flow magnitude, and interaction features that combine the soft gate with the negative run and local area to capture potential drainage opportunities. 
+    Additionally, there are features that capture late-horizon conditions based on the relative time step (tr) and their interaction with the soft gate.
+    The function handles empty input and ensures that the output features are aligned with the original row order. The features are designed to be used in a machine learning model to help predict future states of the system based on the recent dynamics of inflow and outflow.
+
+    Parameters:
+    - qin_hat: 1D array of predicted inflow values (shape (num_rows,))
+    - qout_hat: 1D array of predicted outflow values (shape (num_rows,))
+    - eid: 1D array of event IDs corresponding to each row (shape (num_rows,))
+    - nidx: 1D array of node indices corresponding to each row (shape (num_rows,))
+    - tr: 1D array of relative time steps corresponding to each row (shape (num_rows,))
+    - nt: 1D array of event types corresponding to each row (shape (num_rows,))
+    - local_area: 1D array of local area values corresponding to each row (shape (num_rows,))
+    - late_start: Integer specifying the relative time step at which to start considering late-horizon features (default is 108)
+
+    The output is a 2D array of shape (num_rows, 10) containing the constructed features for each row, in the original order. The features are:
+    0: net flow (qin - qout)
+    1: cumulative net flow (cumulative sum of net flow within each (event, node) sequence)
+    2: normalized cumulative net flow (cumulative net flow divided by the sum of absolute values of cumulative net flow, qin, and qout)
+    3: first difference in net flow (current net flow minus previous net flow within the same (event, node) sequence)
+    4: third difference in net flow (current net flow minus net flow from three steps ago within the same (event, node) sequence)
+    5: negative run (count of consecutive negative net flow values, reset to 0 when net flow is non-negative, within the same (event, node) sequence)
+    6: soft gate (a value between 0 and 1 based on the net flow magnitude, designed to downweight large positive net flow values and upweight negative net flow values)
+    7: drain opportunity (interaction of soft gate, negative run, local area, and event type, designed to capture potential drainage opportunities for type-1 nodes)
+    8: late soft (interaction of soft gate and late relative time, designed to capture potential late-horizon conditions)
+    9: late drain opportunity (interaction of drain opportunity and late relative time, designed to capture potential late-horizon drainage opportunities)
     """
     qin = np.asarray(qin_hat, dtype=np.float32).reshape(-1)
     qout = np.asarray(qout_hat, dtype=np.float32).reshape(-1)
@@ -2640,7 +2705,6 @@ def _build_qinout_drain_dynamics_block(
         axis=1,
     ).astype(np.float32, copy=False)
 
-
 def _build_qinout_transform_block(
     qin_hat: np.ndarray,
     qout_hat: np.ndarray,
@@ -2649,6 +2713,29 @@ def _build_qinout_transform_block(
     tr: np.ndarray,
 ) -> np.ndarray:
     """Compact qin/qout transform block: signed asinh + event-relative anomalies."""
+    '''
+    This function constructs a block of features based on the predicted inflow (qin_hat) and outflow (qout_hat) values, along with their corresponding event IDs, node indices, and relative time steps. The features include signed asinh transforms of qin and qout, the net flow (qin - qout), the first difference in net flow, and event-relative anomaly features for qin, qout, and net flow.
+    The function handles empty input and ensures that the output features are aligned with the original row order
+    The event-relative anomaly features are computed by standardizing the values of qin, qout, and net flow within each event, using the median and interquartile range to capture how anomalous a particular value is relative to the typical values for that event. This can help the model identify unusual conditions that may be important for prediction.
+    The signed asinh transform is used to handle the wide range of values in qin and qout while preserving the sign and providing a more normalized scale for the features.
+    Parameters:
+    - qin_hat: 1D array of predicted inflow values (shape (num_rows,))
+    - qout_hat: 1D array of predicted outflow values (shape (num_rows,))
+    - eid: 1D array of event IDs corresponding to each row (shape (num_rows,))
+    - nidx: 1D array of node indices corresponding to each row (shape (num_rows,))
+    - tr: 1D array of relative time steps corresponding to each row (shape (num_rows,))
+
+    The output is a 2D array of shape (num_rows, 8) containing the constructed features for each row, in the original order. The features are:
+    0: signed asinh transform of qin
+    1: signed asinh transform of qout
+    2: signed asinh transform of net flow
+    3: signed asinh transform of first difference in net flow
+    4: event-relative anomaly for qin
+    5: event-relative anomaly for qout
+    6: event-relative anomaly for net flow
+    7: event-relative anomaly for first difference in net flow
+
+    '''
     qin = np.asarray(qin_hat, dtype=np.float32).reshape(-1)
     qout = np.asarray(qout_hat, dtype=np.float32).reshape(-1)
     eid = np.asarray(eid, dtype=np.int64).reshape(-1)
@@ -2682,6 +2769,10 @@ def _build_qinout_transform_block(
     dnet = dnet_s[inv].astype(np.float32, copy=False)
 
     def _scale(v: np.ndarray) -> float:
+        '''
+        This function computes a robust scale factor for the input array v, based on the 75th percentile of the absolute values of v. 
+        This is used to normalize the asinh transform of qin, qout, net, and dnet, providing a more stable scale for the features while being less sensitive to extreme outliers than using the maximum value. The small constant added (1e-6) ensures that we do not divide by zero in cases where v may be very small or all zeros.
+        '''
         return float(np.quantile(np.abs(v.astype(np.float64, copy=False)), 0.75) + 1e-6)
 
     qin_t = np.arcsinh(qin / _scale(qin)).astype(np.float32, copy=False)
@@ -2728,6 +2819,28 @@ def _build_qhat_graph_feature_block(
     add_hop2_features: bool = False,
     add_downstream_features: bool = False,
 ) -> np.ndarray:
+    '''
+    This function builds graph-aware features from the qhat predictions, including upstream neighbor aggregates with optional multi-hop decay, and optionally adds explicit 2-hop features and downstream aggregates.
+    The features are constructed in a causal, leakage-safe manner by processing data in blocks of (event, t_rel) and aggregating over the graph structure defined by edge_index.
+    The output is a feature matrix of shape (num_samples, num_features) that can be concatenated with other features for model training or inference.
+    Parameters:
+    - qhat: predicted q values to build features from
+    - eid: event IDs corresponding to each qhat entry
+    - nidx: node indices corresponding to each qhat entry
+    - tr: time-relative values corresponding to each qhat entry
+    - edge_index: graph edge index defining the connectivity for aggregation
+    - num_nodes: total number of nodes in the graph
+    - hops: number of hops for upstream aggregation
+    - decay: per-hop decay factor for aggregation (applied from hop 2 onward)
+    - add_hop2_features: whether to add explicit 2-hop upstream features
+    - add_downstream_features: whether to add downstream aggregates as features
+
+    The output features include:
+    - Upstream sum and mean aggregates of qhat for each node, with optional multi-hop decay
+    - Optional explicit 2-hop upstream aggregates of qhat
+    - Optional downstream sum and mean aggregates of qhat for each node
+    The function handles empty input and ensures that the output features are aligned with the original row order. It uses efficient numpy operations and sparse matrix representations for aggregation when possible.
+    '''
     q = np.asarray(qhat, dtype=np.float32).reshape(-1)
     eid = np.asarray(eid, dtype=np.int64).reshape(-1)
     nidx = np.asarray(nidx, dtype=np.int64).reshape(-1)
@@ -2758,6 +2871,12 @@ def _build_qhat_graph_feature_block(
         np.add.at(outdeg, src, 1.0)
 
     def _agg(v: np.ndarray, upstream: bool) -> np.ndarray:
+        '''
+        Aggregate values over the graph structure.
+        If upstream is True, aggregate from source to destination (i.e., gather from neighbors). If False, aggregate from destination to source (i.e., scatter to neighbors).
+        For multi-hop aggregation with decay, we iteratively multiply by the adjacency matrix and apply the decay factor to the contributions from each hop. 
+        If sparse matrix support is available, we use efficient matrix multiplication; otherwise, we fall back to numpy operations with np.add.at for aggregation.
+        '''
         x = np.asarray(v, dtype=np.float32).reshape(-1)
         if sp is not None and a_up is not None and a_dn is not None:
             mat = a_up if upstream else a_dn
@@ -2784,6 +2903,11 @@ def _build_qhat_graph_feature_block(
         return out
 
     def _agg_hop(v: np.ndarray, upstream: bool, hop: int) -> np.ndarray:
+        '''
+        Aggregate values over a specific number of hops in the graph structure.
+        If upstream is True, aggregate from source to destination (i.e., gather from neighbors). If False, aggregate from destination to source (i.e., scatter to neighbors).
+        This function is used to compute explicit multi-hop features when add_hop2_features is True. It performs the aggregation iteratively for the specified number of hops, applying the decay factor if hops > 1.
+        '''
         hop = int(max(1, hop))
         x = np.asarray(v, dtype=np.float32).reshape(-1)
         if sp is not None and a_up is not None and a_dn is not None:
@@ -2870,6 +2994,26 @@ def _augment_with_qnet_state_features(
     roll_windows=(3, 8, 24),
     lags=(1, 2, 4),
 ) -> np.ndarray:
+    '''
+    This function augments the input feature matrix X with additional features derived from the qhat predictions and their temporal state, including rolling window statistics and lagged values.
+    The additional features are constructed in a causal, leakage-safe manner by processing data in blocks of (event, t_rel) and computing the rolling statistics and lags within each block. 
+    This ensures that the features for a given time step only depend on current and past information, making them suitable for training predictive models without leakage.
+    The output is a feature matrix of shape (num_samples, num_original_features + num_new_features) that can be used for model training or inference.
+    Parameters:
+    - X: original feature matrix to augment (shape (num_samples, num_original_features))
+    - qhat: predicted q values to build features from (shape (num_samples,))
+    - eid: event IDs corresponding to each qhat entry (shape (num_samples,))
+    - nidx: node indices corresponding to each qhat entry (shape (num_samples,))
+    - tr: time-relative values corresponding to each qhat entry (shape (num_samples,))
+    - roll_windows: tuple of integers specifying the window sizes for rolling statistics (default is (3, 8, 24))
+    - lags: tuple of integers specifying the lag steps for lagged features (default is (1, 2, 4))
+        
+    The new features include:
+    - Rolling mean and standard deviation of qhat for each specified window size, computed in a causal manner
+    - Lagged values of qhat for each specified lag step, computed in a causal manner
+    The function handles empty input and ensures that the output features are aligned with the original row order. It uses efficient numpy operations for computing rolling statistics and lagged values within each (event, t_rel) block.
+    
+    '''
     block = _build_qnet_state_feature_block(
         qhat=qhat,
         eid=eid,
@@ -2894,6 +3038,29 @@ def _augment_with_qhat_graph_features(
     add_hop2_features: bool = False,
     add_downstream_features: bool = False,
 ) -> np.ndarray:
+    '''
+    This function augments the input feature matrix X with additional graph-aware features derived from the qhat predictions, including upstream neighbor aggregates with optional multi-hop decay, and optionally explicit 2-hop features and downstream aggregates.
+    The additional features are constructed in a causal, leakage-safe manner by processing data in blocks of (event, t_rel) and aggregating over the graph structure defined by edge_index, ensuring that the features for a given time step only depend on current and past information.
+    The output is a feature matrix of shape (num_samples, num_original_features + num_new_features) that can be used for model training or inference.
+    Parameters:
+    - X: original feature matrix to augment (shape (num_samples, num_original_features))
+    - qhat: predicted q values to build features from (shape (num_samples,))
+    - eid: event IDs corresponding to each qhat entry (shape (num_samples,))
+    - nidx: node indices corresponding to each qhat entry (shape (num_samples,))
+    - tr: time-relative values corresponding to each qhat entry (shape (num_samples,))
+    - edge_index: graph edge index defining the connectivity for aggregation
+    - num_nodes: total number of nodes in the graph
+    - hops: number of hops for upstream aggregation (default is 1)
+    - decay: per-hop decay factor for aggregation (applied from hop 2 onward, default is 1.0)
+    - add_hop2_features: whether to add explicit 2-hop upstream features (default is False)
+    - add_downstream_features: whether to add downstream aggregates as features (default is False)
+    
+    The new features include:
+    - Upstream sum and mean aggregates of qhat for each node, with optional multi-hop decay
+    - Optional explicit 2-hop upstream aggregates of qhat
+    - Optional downstream sum and mean aggregates of qhat for each node
+    - Optional imbalance features comparing upstream and downstream aggregates
+    '''
     block = _build_qhat_graph_feature_block(
         qhat=qhat,
         eid=eid,
@@ -2929,6 +3096,49 @@ def _build_mc_route_feature_block(
     v11: bool = False,
     phys_v2: bool = False,
 ) -> np.ndarray:
+    '''
+    This function builds features for a Muskingum routing-inspired model based on the predicted inflow (qin_hat) and outflow (qout_hat) values, along with their corresponding event IDs, node indices, relative time steps, and event types. 
+    It also incorporates graph structure and static edge features to create node-adaptive routing parameters.
+    The features include the predicted inflow and outflow, a reference flow (which can be set to zero if qhat_ref is None), and graph-based features derived from the edge_index and static edge attributes. 
+    The function handles empty input and ensures that the output features are aligned with the original row order.
+    The Muskingum routing-inspired features are designed to capture the dynamics of flow through the network, with node-adaptive parameters that can reflect the physical characteristics of the edges connected to each node. 
+    This can help the model learn more accurate representations of flow dynamics and improve predictive performance.
+
+    Parameters:
+    - qin_hat: 1D array of predicted inflow values (shape (num_rows,))
+    - qout_hat: 1D array of predicted outflow values (shape (num_rows,))
+    - qhat_ref: 1D array of reference flow values to compare against (shape (num_rows,)), can be None to use zeros
+    - eid: 1D array of event IDs corresponding to each row (shape (num_rows,))
+    - nidx: 1D array of node indices corresponding to each row (shape (num_rows,))
+    - tr: 1D array of relative time steps corresponding to each row (shape (num_rows,))
+    - nt: 1D array of event types corresponding to each row (shape (num_rows,))
+    - edge_index: graph edge index defining the connectivity for aggregation
+    - num_nodes: total number of nodes in the graph
+    - static_edges: 2D array of static edge features (shape (num_edges, num_edge_features)), can be None if not available
+    - static_edge_names: list of names for the static edge features, in the same order as the columns of static_edges, used to identify specific features like length, diameter, roughness, slope (list of strings), can be None if static_edges is None
+    - edge_normalizer: an optional normalizer object with a denormalize method to convert normalized edge features back to their original scale, used if edge_is_normalized is True
+    - edge_is_normalized: whether the static edge features are normalized and need to be denormalized using edge_normalizer (boolean)
+    - k: base Muskingum K parameter (float, default is 3.0)
+    - x: base Muskingum X parameter (float, default is 0.2)
+    - late_start: relative time step at which to start applying the late drain opportunity feature (int, default is 108, which corresponds to 18 hours if time steps are 10 minutes)
+    - v11: whether to use the v11 version of features which includes additional graph-based features (boolean, default is False)
+    - phys_v2: whether to use the phys_v2 version of features which includes additional graph-based features and modifications to the base K parameter (boolean, default is False)
+
+        The output is a 2D array of shape (num_rows, num_features) containing the constructed features for each row, in the original order. The features include:
+        - qin_hat: the predicted inflow for the node at the given time step
+        - qout_hat: the predicted outflow for the node at the given time step
+        - qref: the reference flow value for the node at the given time step (can be zeros if qhat_ref is None)
+        - Graph-based features derived from edge_index and static edge attributes, which can include node-adaptive routing parameters and other characteristics of the node's connectivity and edge attributes. 
+        The specific features included depend on the v11 and phys_v2 flags, and may include:
+        - K_node: node-adaptive Muskingum K parameter based on edge attributes
+        - X_node: node-adaptive Muskingum X parameter based on edge attributes
+        - out_cap: total outgoing capacity from the node based on edge attributes
+        - in_cap: total incoming capacity to the node based on edge attributes
+        - out_len_m: mean outgoing edge length from the node based on edge attributes
+        - out_rough_m: mean outgoing edge roughness from the node based on edge attributes
+        - out_slope_m: mean outgoing edge slope from the node based on edge attributes
+        The function is designed to provide rich features for a Muskingum routing-inspired model that can capture the dynamics of flow through the network while being informed by the physical characteristics of the edges and the graph structure.
+    '''
     qin = np.asarray(qin_hat, dtype=np.float32).reshape(-1)
     qout = np.asarray(qout_hat, dtype=np.float32).reshape(-1)
     if qhat_ref is None:
@@ -3206,6 +3416,17 @@ def _build_mc_route_feature_block(
 
 
 def _future_max_within_h(v: np.ndarray, h: int) -> np.ndarray:
+    '''
+    This function computes the future maximum value within a specified horizon h for each element in the input array v.
+    For each index i in the input array, it looks ahead up to h steps (i+1 to i+h) and computes the maximum value in that range. If the range extends beyond the end of the array, it treats those positions as negative infinity, effectively ignoring them in the maximum calculation.
+    The function uses numpy's stride tricks to create a sliding window view of the future values and computes the maximum efficiently. The output is an array of the same shape as the input, where each element contains the maximum future value within the horizon h.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+
+    Returns:
+    - An array of the same shape as v, where each element is the maximum value in the future range defined by h.
+    '''
     h = int(max(1, h))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
     m = x.shape[0]
@@ -3218,6 +3439,19 @@ def _future_max_within_h(v: np.ndarray, h: int) -> np.ndarray:
 
 
 def _future_max_in_range(v: np.ndarray, h_start: int, h_end: int) -> np.ndarray:
+    '''
+    This function computes the future maximum value within a specified range for each element in the input array v.
+    For each index i in the input array, it looks ahead from h_start to h_end steps (i+h_start to i+h_end) and computes the maximum value in that range. If the range extends beyond the end of the array, it treats those positions as negative infinity, effectively ignoring them in the maximum calculation.
+    The function uses numpy's stride tricks to create a sliding window view of the future values and computes the maximum efficiently. The output is an array of the same shape as the input, where each element contains the maximum future value within the specified range.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h_start: starting horizon for looking ahead (int, must be >= 1)
+    - h_end: ending horizon for looking ahead (int, must be >= h_start)
+
+    Returns:
+    - An array of the same shape as v, where each element is the maximum value in the future range defined by h_start and h_end.
+
+    '''
     h_start = int(max(1, h_start))
     h_end = int(max(h_start, h_end))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
@@ -3231,6 +3465,17 @@ def _future_max_in_range(v: np.ndarray, h_start: int, h_end: int) -> np.ndarray:
 
 
 def _future_min_within_h(v: np.ndarray, h: int) -> np.ndarray:
+    '''
+    This function computes the future minimum value within a specified horizon h for each element in the input array v.
+    For each index i in the input array, it looks ahead up to h steps (i+1 to i+h) and computes the minimum value in that range. If the range extends beyond the end of the array, it treats those positions as positive infinity, effectively ignoring them in the minimum calculation.
+    The function uses numpy's stride tricks to create a sliding window view of the future values and computes the minimum efficiently. The output is an array of the same shape as the input, where each element contains the minimum future value within the horizon h.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+
+    Returns:
+    - An array of the same shape as v, where each element is the minimum value in the future range defined by h.
+    '''
     h = int(max(1, h))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
     m = x.shape[0]
@@ -3243,6 +3488,17 @@ def _future_min_within_h(v: np.ndarray, h: int) -> np.ndarray:
 
 
 def _future_sum_within_h(v: np.ndarray, h: int) -> np.ndarray:
+    '''
+    This function computes the future sum of values within a specified horizon h for each element in the input array v.
+    For each index i in the input array, it sums the values from i+1 to i+h (inclusive). If the range extends beyond the end of the array, it only sums the available values.
+    The function uses cumulative sum for efficient computation. The output is an array of the same shape as the input, where each element contains the sum of future values within the horizon h.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+
+    Returns:
+    - An array of the same shape as v, where each element is the sum of values in the future range defined by h.
+    '''
     h = int(max(1, h))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
     m = x.shape[0]
@@ -3257,6 +3513,17 @@ def _future_sum_within_h(v: np.ndarray, h: int) -> np.ndarray:
 
 
 def _future_any_within_h(v_bool: np.ndarray, h: int) -> np.ndarray:
+    '''
+    This function checks if any true value exists within a specified horizon h for each element in the input boolean array v_bool.
+    For each index i in the input array, it looks ahead up to h steps (i+1 to i+h) and checks if any value in that range is true. If the range extends beyond the end of the array, it treats those positions as false.
+    The function uses numpy's stride tricks to create a sliding window view and checks for any true values efficiently. The output is an array of the same shape as the input, where each element is 1.0 if any future value within the horizon h is true, otherwise 0.0.
+    Parameters:
+    - v_bool: input array of boolean values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+
+    Returns:
+    - An array of the same shape as v_bool, where each element is 1.0 if any value in the future range defined by h is true, otherwise 0.0.
+    '''
     h = int(max(1, h))
     x = np.asarray(v_bool, dtype=np.float32).reshape(-1)
     m = x.shape[0]
@@ -3269,6 +3536,18 @@ def _future_any_within_h(v_bool: np.ndarray, h: int) -> np.ndarray:
 
 
 def _future_mean_in_range(v: np.ndarray, h_start: int, h_end: int) -> np.ndarray:
+    '''
+    This function computes the future mean value within a specified range for each element in the input array v.
+    For each index i in the input array, it looks ahead from h_start to h_end steps (i+h_start to i+h_end) and computes the mean value in that range. If the range extends beyond the end of the array, it only includes the available values.
+    The function uses cumulative sum for efficient computation. The output is an array of the same shape as the input, where each element contains the mean of future values within the specified range.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h_start: starting horizon for looking ahead (int, must be >= 1)
+    - h_end: ending horizon for looking ahead (int, must be >= h_start)
+
+    Returns:
+    - An array of the same shape as v, where each element is the mean value in the future range defined by h_start and h_end.
+    '''
     h_start = int(max(1, h_start))
     h_end = int(max(h_start, h_end))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
@@ -3294,6 +3573,19 @@ def _future_time_to_first_sustained_true(
     *,
     exclude_current: bool,
 ) -> np.ndarray:
+    '''
+    This function computes the time to the first sustained true condition within a specified horizon h for each element in the input boolean array cond_bool.
+    For each index i, it looks ahead up to h steps and finds the earliest position where a run of run_len consecutive true values starts. If exclude_current is True, it starts looking from i+1, otherwise from i.
+    If no such run is found within the horizon, it returns h+1. The function handles edge cases like empty arrays or invalid parameters.
+    Parameters:
+    - cond_bool: input array of boolean conditions (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+    - run_len: length of the sustained true run to look for (int, must be >= 1)
+    - exclude_current: whether to exclude the current index i from the search (bool)
+
+    Returns:
+    - An array of the same shape as cond_bool, where each element is the time steps to the first sustained true run within horizon h, or h+1 if not found.
+    '''
     h = int(max(1, h))
     run_len = int(max(1, run_len))
     x = np.asarray(cond_bool, dtype=bool).reshape(-1)
@@ -3327,6 +3619,20 @@ def _future_time_to_first_sustained_drop(
     eps_drop: float,
     total_drop_min: float,
 ) -> np.ndarray:
+    '''
+    This function computes the time to the first sustained drop in values within a specified horizon h for each element in the input array v.
+    For each index i, it looks ahead up to h steps and finds the earliest position where a run of run_len consecutive differences are all <= -eps_drop, and optionally the total drop in that run is <= -total_drop_min.
+    If no such run is found within the horizon, it returns h+1. The function handles edge cases like empty arrays or invalid parameters.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+    - run_len: length of the sustained drop run to look for (int, must be >= 1)
+    - eps_drop: minimum drop per step in the run (float, must be > 0)
+    - total_drop_min: minimum total drop in the run (float, if > 0, also checked)
+
+    Returns:
+    - An array of the same shape as v, where each element is the time steps to the first sustained drop run within horizon h, or h+1 if not found.
+    '''
     h = int(max(1, h))
     run_len = int(max(1, run_len))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
@@ -3363,6 +3669,19 @@ def _future_time_to_near_baseline(
     run_len: int,
     baseline_band: float,
 ) -> np.ndarray:
+    '''
+    This function computes the time to the first sustained near-baseline condition within a specified horizon h for each element in the input array v.
+    The baseline is defined as the minimum value in the array. For each index i, it looks ahead and finds the earliest position where a run of run_len consecutive values are all within baseline_band of the baseline.
+    It uses _future_time_to_first_sustained_true internally with the condition v <= (baseline + baseline_band).
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+    - run_len: length of the sustained near-baseline run to look for (int, must be >= 1)
+    - baseline_band: tolerance band around the baseline (float, must be >= 0)
+
+    Returns:
+    - An array of the same shape as v, where each element is the time steps to the first sustained near-baseline run within horizon h, or h+1 if not found.
+    '''
     x = np.asarray(v, dtype=np.float32).reshape(-1)
     if x.size == 0:
         return np.zeros((0,), dtype=np.float32)
@@ -3377,6 +3696,17 @@ def _future_time_to_near_baseline(
 
 
 def _future_remaining_excess_storage_frac(v: np.ndarray, h: int) -> np.ndarray:
+    '''
+    This function computes the fraction of remaining excess storage h steps into the future for each element in the input array v.
+    The baseline is the minimum value in the array. Excess storage at each point is max(v - baseline, 0). For each index i, it computes excess[i+h] / excess[i], clipped to [0, 1].
+    If excess[i] <= 1e-6, it returns 0.0. This represents how much of the current excess storage remains after h steps.
+    Parameters:
+    - v: input array of values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+
+    Returns:
+    - An array of the same shape as v, where each element is the fraction of remaining excess storage after h steps, in [0, 1].
+    '''
     h = int(max(1, h))
     x = np.asarray(v, dtype=np.float32).reshape(-1)
     m = x.shape[0]
@@ -3400,6 +3730,22 @@ def _future_time_to_release_completion(
     completion_eps: float,
     completion_abs_max: float,
 ) -> np.ndarray:
+    '''
+    This function computes the time to the first sustained release completion within a specified horizon h.
+    Release completion is defined as qout <= qin + completion_eps and qout <= completion_abs_max.
+    For each index i, it looks ahead and finds the earliest position where a run of run_len consecutive steps satisfy the completion condition.
+    It uses _future_time_to_first_sustained_true internally with the combined condition.
+    Parameters:
+    - qin: input array of inflow values (shape (m,))
+    - qout: input array of outflow values (shape (m,))
+    - h: horizon for looking ahead (int, must be >= 1)
+    - run_len: length of the sustained completion run to look for (int, must be >= 1)
+    - completion_eps: tolerance for qout relative to qin (float, must be >= 0)
+    - completion_abs_max: absolute maximum for qout (float, must be >= 0)
+
+    Returns:
+    - An array of the same shape as qin/qout, where each element is the time steps to the first sustained release completion within horizon h, or h+1 if not found.
+    '''
     qin_v = np.asarray(qin, dtype=np.float32).reshape(-1)
     qout_v = np.asarray(qout, dtype=np.float32).reshape(-1)
     cond = (qout_v <= (qin_v + float(max(0.0, completion_eps)))) & (
@@ -4546,6 +4892,16 @@ def _build_routing_oof_targets_from_series(
 
 
 def _parse_csv_nums(s: str, cast_fn):
+    '''
+    Parses a comma-separated string of numbers into a list, applying a casting function to each.
+    Ignores empty tokens after stripping whitespace.
+    Parameters:
+    - s: comma-separated string of numbers
+    - cast_fn: function to cast each number (e.g., int, float)
+
+    Returns:
+    - List of casted numbers
+    '''
     vals = []
     for x in s.split(","):
         x = x.strip()
@@ -4692,6 +5048,16 @@ def _join_anchor_by_event_node(
 
 
 def _load_meta_pred_table(path: str, value_col: str):
+    '''
+    Loads meta prediction data from NPZ, Parquet, or CSV files.
+    Supports various column name aliases for event_id, node_id, t_rel, and the value column.
+    Parameters:
+    - path: path to the file (.npz, .parquet, or .csv)
+    - value_col: name of the value column to load
+
+    Returns:
+    - Tuple of (event_id, node_id, t_rel, values) as numpy arrays
+    '''
     if path is None:
         raise ValueError("meta prediction path is None.")
     p = str(path)
@@ -4740,6 +5106,15 @@ def _norm_wl_if_needed(ds, arr: np.ndarray) -> np.ndarray:
 
 
 def _static_volume_geometry(ds):
+    '''
+    Extracts static volume geometry features from the dataset, denormalizing if necessary.
+    Returns invert elevation, base area, and 2D area for each node.
+    Parameters:
+    - ds: dataset object with static_nodes and STATIC_NODE_FEATURES
+
+    Returns:
+    - Tuple of (invert_elevation, base_area, area_2d) arrays
+    '''
     static_nodes = np.asarray(ds.static_nodes, dtype=np.float32)
     if bool(getattr(ds, "is_normalized", False)):
         static_phys = static_nodes.copy()
@@ -4772,6 +5147,17 @@ def _static_volume_geometry(ds):
 
 
 def _sample_invert_area(ds, nidx: np.ndarray, nt: np.ndarray):
+    '''
+    Samples invert elevation and area for given node indices and types.
+    Uses area_2d for type 2 nodes, base_area for others.
+    Parameters:
+    - ds: dataset object
+    - nidx: node indices array
+    - nt: node types array
+
+    Returns:
+    - Tuple of (invert_elevation, area) arrays for the sampled nodes
+    '''
     invert_nodes, base_area_nodes, area_2d_nodes = _static_volume_geometry(ds)
     idx = np.asarray(nidx, dtype=np.int64).reshape(-1)
     typ = np.asarray(nt, dtype=np.int64).reshape(-1)
@@ -4782,6 +5168,16 @@ def _sample_invert_area(ds, nidx: np.ndarray, nt: np.ndarray):
 
 
 def _sample_invert_surface(ds, nidx: np.ndarray):
+    '''
+    Samples invert elevation and surface elevation for given node indices.
+    Denormalizes if necessary.
+    Parameters:
+    - ds: dataset object
+    - nidx: node indices array
+
+    Returns:
+    - Tuple of (invert_elevation, surface_elevation) arrays for the sampled nodes
+    '''
     static_nodes = np.asarray(ds.static_nodes, dtype=np.float32)
     if bool(getattr(ds, "is_normalized", False)):
         static_phys = static_nodes.copy()
@@ -5045,6 +5441,14 @@ def _save_npz(path: str, **arrays) -> None:
 
 
 def _load_npz_if_exists(path: str):
+    '''
+    Loads an NPZ file if it exists, otherwise returns None.
+    Parameters:
+    - path: path to the NPZ file
+
+    Returns:
+    - Loaded NPZ object or None
+    '''
     if not os.path.exists(path):
         return None
     return np.load(path, allow_pickle=False)
@@ -5384,12 +5788,31 @@ def _build_tail_focus_weights(
 
 
 def _event_range(total: int, limit: int):
+    '''
+    Returns a range object for events, limited if limit is specified.
+    Parameters:
+    - total: total number of events
+    - limit: maximum number of events to include, or None for all
+
+    Returns:
+    - Range object
+    '''
     if limit is None or limit < 0 or limit >= total:
         return range(total)
     return range(limit)
 
 
 def _apply_type_filter(arrays, nt: np.ndarray, type_filter: str):
+    '''
+    Filters arrays based on node type.
+    Parameters:
+    - arrays: tuple of arrays to filter
+    - nt: node type array
+    - type_filter: "all" or type number
+
+    Returns:
+    - Tuple of filtered arrays
+    '''
     if str(type_filter) == "all":
         return arrays
     t = int(type_filter)
@@ -5398,6 +5821,18 @@ def _apply_type_filter(arrays, nt: np.ndarray, type_filter: str):
 
 
 def _apply_type1_subtype_filter(arrays, ds, nidx: np.ndarray, nt: np.ndarray, subtype_filter: str):
+    '''
+    Filters arrays based on type1 subtype (boundary_pressure or interior_corridor).
+    Parameters:
+    - arrays: tuple of arrays to filter
+    - ds: dataset object
+    - nidx: node indices
+    - nt: node types
+    - subtype_filter: "all", "boundary_pressure", or "interior_corridor"
+
+    Returns:
+    - Tuple of (filtered_arrays, metadata_dict)
+    '''
     subtype = str(subtype_filter)
     if subtype == "all":
         return arrays, None
@@ -10860,6 +11295,17 @@ def _collect_samples(ds,
 
 
 def _compute_qin_qout_series(ds, node_dynamic_features: np.ndarray, edge_dynamic_features: np.ndarray):
+    '''
+    Computes qin and qout series from node and edge dynamic features.
+    Aggregates edge flows to compute inflow and outflow for each node over time.
+    Parameters:
+    - ds: dataset object with edge_index and feature indices
+    - node_dynamic_features: array of node dynamic features (time, node, feature)
+    - edge_dynamic_features: array of edge dynamic features (time, edge, feature)
+
+    Returns:
+    - Tuple of (qin_series, qout_series) arrays
+    '''
     inlet_idx = ds.DYNAMIC_NODE_FEATURES.index("inlet_flow")
     edge_idx = ds.DYNAMIC_EDGE_FEATURES.index("flow")
     inlet = node_dynamic_features[:, :, inlet_idx].astype(np.float32, copy=False)
