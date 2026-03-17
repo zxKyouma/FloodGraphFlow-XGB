@@ -34,19 +34,22 @@ After downloading:
 Your directory should look like this:
 ```
 FloodGraphFlow-XGB
-├── configs
-├── scripts
-├── utils
+...
 ├── Models
 │   ├── Model_1
 │   │   ├── train
+│   │   │   ├── events.csv
+│   │   │   ├── events_split_seed42
+│   │   │   │   ├── train_split.csv
+│   │   │   │   └── val_split.csv
+│   │   │   └── events_hardholdout_seed42
 │   │   ├── test
-│   │   └── csv_features_stats.yaml
+│   │   │   └── events.csv
+│   │   ├── processed
+│   │   │   └── csv_features_stats.yaml
+│   │   └── model1_node_pca.joblib
 │   └── Model_2
-│       ├── train
-│       ├── test
-│       └── csv_features_stats.yaml
-├── environment.yml
+...
 └── README.md
 ```
 
@@ -139,7 +142,7 @@ All hyperparameters were tuned using **Optuna**.
 
 ### Feature Engineering
 
-The final submission used a total of 231 featurs.
+The final model used a total of 231 features.
 
 The strongest feature families in the final submission were:
 
