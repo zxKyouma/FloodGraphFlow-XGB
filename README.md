@@ -51,19 +51,29 @@ FloodGraphFlow-XGB
 
 ## Approach
 
-We use a graph-aware stacked XGBoost pipeline rather than a single end-to-end sequence model. 
+We use a **graph-aware stacked XGBoost pipeline** rather than a single end-to-end sequence model.
 
-Flood behavior in this task is not purely local: each node depends on upstream inflow, downstream blockage, storage, and boundary conditions. A single flat regressor struggled to represent these different hydraulic regimes. By combining graph-derived features, physics- inspired hydraulic proxy features, auxiliary flow surrogates (`qnet`, `qin`, `qout`), and a two-stage regime-aware predictor, the model captures propagation, retention, and delayed drainage more reliably than local rainfall and water-level features alone.
+Flood behavior in this task is **not purely local**: each node depends on *upstream inflow*, *downstream blockage*, *storage*, and *boundary conditions*. A single flat regressor struggled to represent these different hydraulic regimes.
 
-At a high level, the model works in four stages. 
+By combining **graph-derived features**, **physics-inspired hydraulic proxy features**, **auxiliary flow surrogates (`qnet`, `qin`, `qout`)**, and a **two-stage regime-aware predictor**, the model captures propagation, retention, and delayed drainage more reliably than local rainfall and water-level features alone.
 
-- First, we build node-level temporal features from rainfall, water level, and static network attributes, then augment them with graph features, boundary and endpoint indicators, and storage or mass-deficit proxy features that encode coarse hydraulic structure. 
+At a high level, the model works in **four stages**.
 
-- Second, we train auxiliary stage-A models to predict latent hydraulic quantities such as net flow, inflow, outflow, and selected event-timing targets; their out-of-fold predictions are fed back in as features. 
+**Stage 1 — Graph-aware feature construction**
 
-- Third, a two-stage XGBoost predictor combines regime classification with conditional regression to handle different hydraulic behaviors more effectively than a single global regressor. 
+We build node-level temporal features from rainfall, water level, and static network attributes, then augment them with **graph features**, **boundary indicators**, and **mass-deficit storage proxies** that encode coarse hydraulic structure.
 
-- Finally, the same pipeline is trained separately for `Model_1` and `Model_2`, and the two prediction files are merged into the final submission.
+**Stage 2 — Auxiliary flow prediction**
+
+We train **Stage-A models** to predict latent hydraulic quantities such as **net flow**, **inflow**, and **outflow**. Their **out-of-fold predictions** are fed back into the feature set.
+
+**Stage 3 — Regime-aware prediction**
+
+A **two-stage XGBoost predictor** combines **regime classification** with **conditional regression**, allowing the model to treat calm, rising, and storage-dominated states differently.
+
+**Stage 4 — Final submission assembly**
+
+The full pipeline is trained separately for **`Model_1`** and **`Model_2`**, and their predictions are merged into the final submission.
 
 ### Model Overview
 
