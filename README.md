@@ -57,6 +57,8 @@ Flood behavior in this task is **not purely local**: each node depends on *upstr
 
 By combining **graph-derived features**, **physics-inspired hydraulic proxy features**, **auxiliary flow surrogates (`qnet`, `qin`, `qout`)**, and a **two-stage regime-aware predictor**, the model captures propagation, retention, and delayed drainage more reliably than local rainfall and water-level features alone.
 
+### Model Overview
+
 At a high level, the model works in **four stages**.
 
 **Stage 1 — Graph-aware feature construction**
@@ -75,12 +77,6 @@ A **two-stage XGBoost predictor** combines **regime classification** with **cond
 
 The full pipeline is trained separately for **`Model_1`** and **`Model_2`**, and their predictions are merged into the final submission.
 
-### Model Overview
 
-- Graph-aware feature engineering over the drainage network
-- Stacked predictions for latent hydraulic variables (`qnet`, `qin`, `qout`)
-- Physics-inspired and mass-deficit features for storage and drainage imbalance
-- Two-stage XGBoost prediction with regime classification plus conditional regression
-- Separate training for `Model_1` and `Model_2`, followed by submission merging
 
 
