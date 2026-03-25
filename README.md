@@ -1,4 +1,4 @@
-# FloodGraphFlow-XGB
+# FloodGraphNet
 
 Solution for the Kaggle competition 
 
